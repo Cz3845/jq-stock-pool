@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python \"g:/量化/2026.5.3/test_daima_scraper.py\")",
+      "Bash(python -m py_compile \"g:/量化/2026.5.3/daima.py\" \"g:/量化/2026.5.3/test_daima_scraper.py\")"
+    ]
+  }
+}

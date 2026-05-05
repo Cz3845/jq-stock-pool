@@ -1,9 +1,9 @@
 name: Update Stock Pool
 
 on:
-  # GitHub cron uses UTC. 00:55 UTC = 08:55 Asia/Shanghai.
+  # GitHub cron uses UTC. 00:30 UTC = 08:30 Asia/Shanghai.
   schedule:
-    - cron: '55 0 * * 1-5'
+    - cron: '30 0 * * 1-5'
   workflow_dispatch:
 
 permissions:

@@ -22,7 +22,11 @@ EXTERNAL_STOCK_POOL = {
 
 REMOTE_STOCK_POOL_ENABLED = False
 REMOTE_STOCK_POOL_JSON_URL = ""
-REMOTE_STOCK_POOL_TIMEOUT = 5
+REMOTE_STOCK_POOL_JSON_URLS = []
+REMOTE_STOCK_POOL_TIMEOUT = (3, 15)
+REMOTE_STOCK_POOL_RETRIES = 2
+REMOTE_STOCK_POOL_RETRY_SLEEP = 1
+REMOTE_STOCK_POOL_CACHE = {}
 
 USE_EASTMONEY_FALLBACK = False
 MAX_EXTERNAL_POOL_SIZE = 15
@@ -483,35 +487,73 @@ def get_external_stock_pool(context):
     return raw_codes
 
 
-def get_remote_stock_pool(context):
-    if not REMOTE_STOCK_POOL_ENABLED or not REMOTE_STOCK_POOL_JSON_URL:
-        return None
-    trade_date = context.current_dt.strftime('%Y-%m-%d')
-    try:
-        response = requests.get(REMOTE_STOCK_POOL_JSON_URL, timeout=REMOTE_STOCK_POOL_TIMEOUT)
-    except requests.RequestException as e:
-        log.info(f'远程股票池请求异常：date={trade_date}, 异常={type(e).__name__}: {e}')
-        return None
-    if response.status_code != 200:
-        log.info(f'远程股票池HTTP异常：date={trade_date}, status={response.status_code}, body前500字符={_preview_response_text(response)}')
-        return None
-    try:
-        payload = response.json()
-    except ValueError as e:
-        log.info(f'远程股票池返回非JSON：date={trade_date}, body前500字符={_preview_response_text(response)}, 异常={e}')
-        return None
+def _get_remote_stock_pool_urls():
+    urls = []
+    for url in [REMOTE_STOCK_POOL_JSON_URL] + list(REMOTE_STOCK_POOL_JSON_URLS):
+        url = str(url).strip()
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _extract_remote_stock_pool_codes(payload, trade_date, source_url):
     if not isinstance(payload, dict):
-        log.info(f'远程股票池JSON结构异常：date={trade_date}, 顶层类型={type(payload).__name__}')
+        log.info(f'远程股票池JSON结构异常：date={trade_date}, source={source_url}, 顶层类型={type(payload).__name__}')
         return None
     if trade_date not in payload:
-        log.info(f'远程股票池缺少日期：date={trade_date}')
+        log.info(f'远程股票池缺少日期：date={trade_date}, source={source_url}')
         return None
     codes = payload.get(trade_date)
     if not isinstance(codes, list):
-        log.info(f'远程股票池日期数据结构异常：date={trade_date}, 类型={type(codes).__name__}')
+        log.info(f'远程股票池日期数据结构异常：date={trade_date}, source={source_url}, 类型={type(codes).__name__}')
         return None
-    log.info(f'远程股票池读取成功：date={trade_date}, 原始数量={len(codes)}')
     return codes
+
+
+def _request_remote_stock_pool_payload(url, trade_date):
+    attempts = REMOTE_STOCK_POOL_RETRIES + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, timeout=REMOTE_STOCK_POOL_TIMEOUT)
+        except requests.RequestException as e:
+            log.info(f'远程股票池请求异常：date={trade_date}, source={url}, attempt={attempt}/{attempts}, 异常={type(e).__name__}: {e}')
+            if attempt < attempts:
+                time.sleep(REMOTE_STOCK_POOL_RETRY_SLEEP)
+            continue
+        if response.status_code != 200:
+            log.info(f'远程股票池HTTP异常：date={trade_date}, source={url}, attempt={attempt}/{attempts}, status={response.status_code}, body前500字符={_preview_response_text(response)}')
+            if attempt < attempts:
+                time.sleep(REMOTE_STOCK_POOL_RETRY_SLEEP)
+            continue
+        try:
+            return response.json()
+        except ValueError as e:
+            log.info(f'远程股票池返回非JSON：date={trade_date}, source={url}, body前500字符={_preview_response_text(response)}, 异常={e}')
+            return None
+    return None
+
+
+def get_remote_stock_pool(context):
+    if not REMOTE_STOCK_POOL_ENABLED:
+        return None
+    urls = _get_remote_stock_pool_urls()
+    if not urls:
+        return None
+    trade_date = context.current_dt.strftime('%Y-%m-%d')
+    for url in urls:
+        payload = _request_remote_stock_pool_payload(url, trade_date)
+        codes = _extract_remote_stock_pool_codes(payload, trade_date, url)
+        if codes is not None:
+            REMOTE_STOCK_POOL_CACHE["payload"] = payload
+            REMOTE_STOCK_POOL_CACHE["source"] = url
+            log.info(f'远程股票池读取成功：date={trade_date}, source={url}, 原始数量={len(codes)}')
+            return codes
+    cached_payload = REMOTE_STOCK_POOL_CACHE.get("payload")
+    cached_codes = _extract_remote_stock_pool_codes(cached_payload, trade_date, REMOTE_STOCK_POOL_CACHE.get("source", "cache"))
+    if cached_codes is not None:
+        log.info(f'使用缓存远程股票池：date={trade_date}, 原始数量={len(cached_codes)}')
+        return cached_codes
+    return None
 
 
 def normalize_and_validate_stock_pool(raw_codes, limit=None):

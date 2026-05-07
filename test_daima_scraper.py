@@ -75,10 +75,11 @@ class FakeSession:
 class FakeRequests:
     RequestException = Exception
 
-    def __init__(self, response=None, get_response=None):
+    def __init__(self, response=None, get_response=None, get_sequence=None):
         self.sessions = []
         self.response = response
         self.get_response = get_response or response or FakeResponse()
+        self.get_sequence = list(get_sequence or [])
         self.get_calls = []
         self.get_error = None
 
@@ -91,6 +92,11 @@ class FakeRequests:
         self.get_calls.append({"url": url, "params": params, "timeout": timeout})
         if self.get_error:
             raise self.get_error
+        if self.get_sequence:
+            next_result = self.get_sequence.pop(0)
+            if isinstance(next_result, BaseException):
+                raise next_result
+            return next_result
         return self.get_response
 
 
@@ -172,6 +178,9 @@ def load_stock_pool_namespace(extra_namespace=None):
         "get_remote_stock_pool",
         "get_today_stock_pool",
         "_preview_response_text",
+        "_get_remote_stock_pool_urls",
+        "_request_remote_stock_pool_payload",
+        "_extract_remote_stock_pool_codes",
     }
     selected_nodes = []
     for node in tree.body:
@@ -184,6 +193,7 @@ def load_stock_pool_namespace(extra_namespace=None):
     namespace = {
         "log": FakeLog(),
         "requests": FakeRequests(),
+        "time": time,
         "get_security_info": lambda code: FakeSecurityInfo(code),
         "get_selected_stocks": lambda context: [],
     }
@@ -273,7 +283,7 @@ class ExternalStockPoolTests(unittest.TestCase):
         self.assertEqual(fake_requests.get_calls, [{
             "url": "https://raw.example.test/stock_pool.json",
             "params": None,
-            "timeout": 5,
+            "timeout": (3, 15),
         }])
 
     def test_get_today_stock_pool_external_date_overrides_remote_pool(self):
@@ -289,6 +299,70 @@ class ExternalStockPoolTests(unittest.TestCase):
 
         self.assertEqual(result, ["300750.XSHE"])
         self.assertEqual(fake_requests.get_calls, [])
+
+    def test_get_remote_stock_pool_retries_after_timeout(self):
+        fake_requests = FakeRequests(get_sequence=[
+            Exception("read timed out"),
+            FakeResponse(
+                text='{"2026-05-07":["000001"]}',
+                headers={"Content-Type": "application/json"},
+                json_data={"2026-05-07": ["000001"]},
+            ),
+        ])
+        namespace = load_stock_pool_namespace({"requests": fake_requests})
+        namespace["REMOTE_STOCK_POOL_ENABLED"] = True
+        namespace["REMOTE_STOCK_POOL_JSON_URL"] = "https://raw.example.test/stock_pool.json"
+        namespace["REMOTE_STOCK_POOL_RETRY_SLEEP"] = 0
+        context = Context()
+        context.current_dt = datetime(2026, 5, 7, 9, 0)
+
+        result = namespace["get_remote_stock_pool"](context)
+
+        self.assertEqual(result, ["000001"])
+        self.assertEqual(len(fake_requests.get_calls), 2)
+
+    def test_get_remote_stock_pool_tries_second_url_after_first_fails(self):
+        fake_requests = FakeRequests(get_sequence=[
+            FakeResponse(status_code=500, text="server error"),
+            FakeResponse(
+                text='{"2026-05-07":["600000"]}',
+                headers={"Content-Type": "application/json"},
+                json_data={"2026-05-07": ["600000"]},
+            ),
+        ])
+        namespace = load_stock_pool_namespace({"requests": fake_requests})
+        namespace["REMOTE_STOCK_POOL_ENABLED"] = True
+        namespace["REMOTE_STOCK_POOL_JSON_URL"] = "https://raw.example.test/stock_pool.json"
+        namespace["REMOTE_STOCK_POOL_JSON_URLS"] = ["https://mirror.example.test/stock_pool.json"]
+        namespace["REMOTE_STOCK_POOL_RETRIES"] = 0
+        context = Context()
+        context.current_dt = datetime(2026, 5, 7, 9, 0)
+
+        result = namespace["get_remote_stock_pool"](context)
+
+        self.assertEqual(result, ["600000"])
+        self.assertEqual([call["url"] for call in fake_requests.get_calls], [
+            "https://raw.example.test/stock_pool.json",
+            "https://mirror.example.test/stock_pool.json",
+        ])
+
+    def test_get_remote_stock_pool_uses_cached_payload_after_later_timeout(self):
+        fake_requests = FakeRequests(get_response=FakeResponse(
+            text='{"2026-05-07":["300750"]}',
+            headers={"Content-Type": "application/json"},
+            json_data={"2026-05-07": ["300750"]},
+        ))
+        namespace = load_stock_pool_namespace({"requests": fake_requests})
+        namespace["REMOTE_STOCK_POOL_ENABLED"] = True
+        namespace["REMOTE_STOCK_POOL_JSON_URL"] = "https://raw.example.test/stock_pool.json"
+        namespace["REMOTE_STOCK_POOL_RETRY_SLEEP"] = 0
+        context = Context()
+        context.current_dt = datetime(2026, 5, 7, 9, 0)
+
+        self.assertEqual(namespace["get_remote_stock_pool"](context), ["300750"])
+        fake_requests.get_error = Exception("read timed out")
+
+        self.assertEqual(namespace["get_remote_stock_pool"](context), ["300750"])
 
     def test_get_today_stock_pool_remote_empty_list_does_not_use_eastmoney(self):
         eastmoney_calls = []
